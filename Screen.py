@@ -274,11 +274,22 @@ class Screen:
             "height": int(y_bot - y_top),
             "mon": self.monitor_number,
         }
-        try:
-            image = array(self.mss.grab(monitor))
-        except Exception as e:
-            self._warn_capture_failure(f"mss.grab() raised {type(e).__name__}: {e}")
-            return None
+        if sys.platform != "win32":
+            # Rootless Xwayland (Plasma Wayland) has no grabbable root window,
+            # so mss/XGetImage cannot be used. Grab the ED window's composited
+            # backing pixmap via XComposite instead. Also correct on plain X11.
+            try:
+                image = edap_linux.grab_region(monitor["left"], monitor["top"],
+                                               monitor["width"], monitor["height"])
+            except Exception as e:
+                self._warn_capture_failure(f"XComposite grab failed: {type(e).__name__}: {e}")
+                return None
+        else:
+            try:
+                image = array(self.mss.grab(monitor))
+            except Exception as e:
+                self._warn_capture_failure(f"mss.grab() raised {type(e).__name__}: {e}")
+                return None
 
         if image is None or image.size == 0 or image.shape[0] == 0 or image.shape[1] == 0:
             self._warn_capture_failure(

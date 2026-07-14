@@ -4,7 +4,7 @@ set -euo pipefail
 
 # --- system packages ---------------------------------------------------------
 sudo pacman -S --needed --noconfirm \
-    python python-pip tk espeak-ng xdotool base-devel
+    python python-pip tk espeak-ng ux xdotool base-devel
 
 # --- uinput access (virtual keyboard for key injection into Proton) ----------
 # Root cause: /dev/uinput is root:root 0600 by default. Grant the 'input'

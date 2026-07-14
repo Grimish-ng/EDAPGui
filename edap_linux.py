@@ -185,9 +185,24 @@ def _window_title(d, win) -> str:
         return ""
 
 
+def _walk_windows(w):
+    yield w
+    try:
+        for c in w.query_tree().children:
+            yield from _walk_windows(c)
+    except Exception:
+        return
+
+
 def _find_elite_window():
     d = _display()
+    # Preferred: EWMH client list (real X window managers)
     for win in _iter_client_windows(d):
+        if _window_title(d, win) == ELITE_WINDOW_TITLE:
+            return d, win
+    # Fallback: full tree walk. Required on KWin/Plasma Wayland, where the
+    # rootless Xwayland root does not carry a usable _NET_CLIENT_LIST.
+    for win in _walk_windows(d.screen().root):
         if _window_title(d, win) == ELITE_WINDOW_TITLE:
             return d, win
     d.close()
@@ -334,9 +349,109 @@ add_hotkey = hotkeys.add_hotkey
 remove_all_hotkeys = hotkeys.remove_all_hotkeys
 
 
+
+# ---------------------------------------------------------------------------
+# XComposite window capture
+#
+# Under rootless Xwayland (Plasma Wayland session) the X root window has no
+# grabbable contents: XGetImage on the root fails with BadMatch, so mss
+# cannot capture. The ED window itself, however, is composited and has a
+# backing pixmap. XComposite NameWindowPixmap gives us that pixmap and
+# XGetImage on it works — same mechanism as OBS xcomposite capture.
+# ---------------------------------------------------------------------------
+
+class EliteWindowGrabber:
+    """Grabs regions of the ED window via XComposite. Coordinates passed to
+    grab() are ROOT (screen) coordinates, matching what Screen.py computes
+    from mss monitor geometry; they are translated to window-relative."""
+
+    def __init__(self):
+        self.d = None
+        self.win = None
+        self.pixmap = None
+        self.win_x = 0
+        self.win_y = 0
+        self._acquire()
+
+    def _acquire(self):
+        self.close()
+        from Xlib.ext import composite
+        d, win = _find_elite_window()
+        if win is None:
+            raise RuntimeError(f"'{ELITE_WINDOW_TITLE}' window not found")
+        if not d.has_extension('Composite'):
+            raise RuntimeError("X server lacks the Composite extension")
+        d.composite_query_version()
+        win.composite_redirect_window(composite.RedirectAutomatic)
+        d.sync()
+        self.d = d
+        self.win = win
+        self.pixmap = win.composite_name_window_pixmap()
+        self.win_x, self.win_y = _root_position(d, win)
+        g = win.get_geometry()
+        self.win_w, self.win_h = g.width, g.height
+
+    def close(self):
+        if self.pixmap is not None:
+            try:
+                self.pixmap.free()
+            except Exception:
+                pass
+            self.pixmap = None
+        if self.d is not None:
+            try:
+                self.d.close()
+            except Exception:
+                pass
+            self.d = None
+
+    def grab(self, left, top, width, height):
+        """Returns a (h, w, 4) uint8 BGRA numpy array (mss-compatible),
+        for the region given in root coordinates."""
+        import numpy as np
+        from Xlib import X
+
+        for attempt in (0, 1):
+            try:
+                x = int(left) - self.win_x
+                y = int(top) - self.win_y
+                w, h = int(width), int(height)
+                # clamp to window bounds; GetImage outside them is BadMatch
+                x = max(0, min(x, self.win_w - 1))
+                y = max(0, min(y, self.win_h - 1))
+                w = max(1, min(w, self.win_w - x))
+                h = max(1, min(h, self.win_h - y))
+                img = self.pixmap.get_image(x, y, w, h, X.ZPixmap, 0xffffffff)
+                buf = img.data
+                if isinstance(buf, str):
+                    buf = buf.encode('latin-1')
+                arr = np.frombuffer(buf, dtype=np.uint8)
+                return arr.reshape(h, w, 4).copy()
+            except Exception:
+                if attempt == 1:
+                    raise
+                # pixmap invalidated (window resized/remapped) — re-acquire once
+                self._acquire()
+
+
+_grabber = None
+
+def grab_region(left, top, width, height):
+    """Module-level convenience wrapper with lazy singleton grabber."""
+    global _grabber
+    if _grabber is None:
+        _grabber = EliteWindowGrabber()
+    return _grabber.grab(left, top, width, height)
+
+
 if __name__ == "__main__":
     print("proton prefix :", proton_prefix())
     print("journal dir   :", journal_dir())
     print("bindings dir  :", bindings_dir())
     print("graphics dir  :", graphics_options_dir())
     print("ED window     :", find_elite_window_rect())
+    try:
+        img = grab_region(*(lambda r: (r[0], r[1], r[2]-r[0], r[3]-r[1]))(find_elite_window_rect()))
+        print(f"capture       : shape={img.shape} mean={img.mean():.1f} max={img.max()}")
+    except Exception as ex:
+        print("capture       : FAILED -", ex)

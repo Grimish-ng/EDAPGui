@@ -18,7 +18,8 @@ class StatusParser:
     Thanks go to Rude. See source at 'https://github.com/RatherRude/Elite-Dangerous-AI-Integration'."""
     def __init__(self, file_path=None):
         if platform != "win32":
-            self.file_path = file_path if file_path else "./linux_ed/Status.json"
+            import edap_linux
+            self.file_path = file_path if file_path else os.path.join(edap_linux.journal_dir(), "Status.json")
         else:
             from WindowsKnownPaths import get_path, FOLDERID, UserHandle
 

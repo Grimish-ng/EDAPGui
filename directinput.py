@@ -3,10 +3,14 @@
 # http://stackoverflow.com/questions/14489013/simulate-python-keypresses-for-controlling-a-game
 # http://www.gamespp.com/directx/directInputKeyboardScanCodes.html
 
-import ctypes
+import sys
 import time
 
-SendInput = ctypes.windll.user32.SendInput
+_IS_WINDOWS = sys.platform == "win32"
+
+if _IS_WINDOWS:
+    import ctypes
+    SendInput = ctypes.windll.user32.SendInput
 
 # Listed are keyboard scan code constants, taken from dinput.h
 SCANCODE = {
@@ -267,51 +271,139 @@ SCANCODE = {
 }
 
 
-# C struct redefinitions
+# ===========================================================================
+# Linux backend: evdev/uinput virtual keyboard
+#
+# DirectInput scancodes (dinput.h / AT set 1) are identical to Linux input
+# keycodes for the entire main keyboard block (0x01..0x58). Extended
+# (0xE0-prefixed) keys differ and are remapped below. Wine/Proton converts
+# evdev keycodes back into the same DIK scancodes in-game, so injecting at
+# the uinput layer is exact — no XTEST, no layout dependency for bindings.
+# ===========================================================================
 
-PUL = ctypes.POINTER(ctypes.c_ulong)
-class KeyBdInput(ctypes.Structure):
-    _fields_ = [("wVk", ctypes.c_ushort),
-                ("wScan", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong),
-                ("dwExtraInfo", PUL)]
+if not _IS_WINDOWS:
+    import atexit
+    from evdev import UInput, ecodes as e
 
-class HardwareInput(ctypes.Structure):
-    _fields_ = [("uMsg", ctypes.c_ulong),
-                ("wParamL", ctypes.c_short),
-                ("wParamH", ctypes.c_ushort)]
+    # DIK (extended) -> Linux input keycode
+    _DIK_TO_LINUX_EXT = {
+        144: e.KEY_PREVIOUSSONG,   # Key_PrevTrack
+        153: e.KEY_NEXTSONG,       # Key_NextTrack
+        156: e.KEY_KPENTER,        # Key_Numpad_Enter
+        157: e.KEY_RIGHTCTRL,      # Key_RightControl
+        160: e.KEY_MUTE,           # Key_Mute
+        161: e.KEY_CALC,           # Key_Calculator
+        162: e.KEY_PLAYPAUSE,      # Key_PlayPause
+        164: e.KEY_STOPCD,         # Key_MediaStop
+        174: e.KEY_VOLUMEDOWN,     # Key_VolumeDown
+        176: e.KEY_VOLUMEUP,       # Key_VolumeUp
+        178: e.KEY_HOMEPAGE,       # Key_WebHome
+        181: e.KEY_KPSLASH,        # Key_Numpad_Divide
+        183: e.KEY_SYSRQ,          # Key_SYSRQ
+        184: e.KEY_RIGHTALT,       # Key_RightAlt
+        197: e.KEY_PAUSE,          # Key_Pause
+        199: e.KEY_HOME,           # Key_Home
+        200: e.KEY_UP,             # Key_UpArrow
+        201: e.KEY_PAGEUP,         # Key_PageUp
+        203: e.KEY_LEFT,           # Key_LeftArrow
+        205: e.KEY_RIGHT,          # Key_RightArrow
+        207: e.KEY_END,            # Key_End
+        208: e.KEY_DOWN,           # Key_DownArrow
+        209: e.KEY_PAGEDOWN,       # Key_PageDown
+        210: e.KEY_INSERT,         # Key_Insert
+        211: e.KEY_DELETE,         # Key_Delete
+        219: e.KEY_LEFTMETA,       # Key_LeftWin
+        220: e.KEY_RIGHTMETA,      # Key_RightWin
+        221: e.KEY_COMPOSE,        # Key_Apps
+        222: e.KEY_POWER,          # Key_Power
+        223: e.KEY_SLEEP,          # Key_Sleep
+        227: e.KEY_WAKEUP,         # Key_Wake
+    }
 
-class MouseInput(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long),
-                ("dy", ctypes.c_long),
-                ("mouseData", ctypes.c_ulong),
-                ("dwFlags", ctypes.c_ulong),
-                ("time",ctypes.c_ulong),
-                ("dwExtraInfo", PUL)]
+    def _dik_to_linux(code: int) -> int | None:
+        if 1 <= code <= 0x58:          # main block: identity
+            return code
+        return _DIK_TO_LINUX_EXT.get(code)
 
-class Input_I(ctypes.Union):
-    _fields_ = [("ki", KeyBdInput),
-                 ("mi", MouseInput),
-                 ("hi", HardwareInput)]
+    _uinput = None
 
-class Input(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong),
-                ("ii", Input_I)]
+    def _get_uinput():
+        global _uinput
+        if _uinput is None:
+            keys = set(range(1, 0x59)) | set(_DIK_TO_LINUX_EXT.values())
+            try:
+                _uinput = UInput({e.EV_KEY: sorted(keys)}, name="edap-virtual-kbd")
+            except PermissionError as ex:
+                raise PermissionError(
+                    "Cannot open /dev/uinput. Install the udev rule "
+                    "(see setup-linux.sh) and ensure you are in the "
+                    "'input' group, then re-login."
+                ) from ex
+            atexit.register(_uinput.close)
+            time.sleep(0.5)  # let libinput/compositor pick up the new device
+        return _uinput
+
+    def _emit(dik_code: int, value: int):
+        kc = _dik_to_linux(dik_code)
+        if kc is None:
+            return
+        ui = _get_uinput()
+        ui.write(e.EV_KEY, kc, value)
+        ui.syn()
+
+    def PressKey(hexKeyCode):
+        _emit(hexKeyCode, 1)
+
+    def ReleaseKey(hexKeyCode):
+        _emit(hexKeyCode, 0)
 
 
-# Actual Functions
+# C struct redefinitions (Windows only)
 
-def PressKey(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = Input_I()
-    ii_.ki = KeyBdInput(0, hexKeyCode, 0x0008, 0, ctypes.pointer(extra))
-    x = Input(ctypes.c_ulong(1), ii_)
-    ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+if _IS_WINDOWS:
+    PUL = ctypes.POINTER(ctypes.c_ulong)
+    class KeyBdInput(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", PUL)]
 
-def ReleaseKey(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = Input_I()
-    ii_.ki = KeyBdInput(0, hexKeyCode, 0x0008 | 0x0002, 0, ctypes.pointer(extra))
-    x = Input(ctypes.c_ulong(1), ii_)
-    ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+    class HardwareInput(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_ulong),
+                    ("wParamL", ctypes.c_short),
+                    ("wParamH", ctypes.c_ushort)]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long),
+                    ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time",ctypes.c_ulong),
+                    ("dwExtraInfo", PUL)]
+
+    class Input_I(ctypes.Union):
+        _fields_ = [("ki", KeyBdInput),
+                     ("mi", MouseInput),
+                     ("hi", HardwareInput)]
+
+    class Input(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong),
+                    ("ii", Input_I)]
+
+
+    # Actual Functions
+
+    def PressKey(hexKeyCode):
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hexKeyCode, 0x0008, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+
+    def ReleaseKey(hexKeyCode):
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        ii_.ki = KeyBdInput(0, hexKeyCode, 0x0008 | 0x0002, 0, ctypes.pointer(extra))
+        x = Input(ctypes.c_ulong(1), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))

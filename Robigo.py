@@ -5,7 +5,6 @@ import time
 
 '''
 import keyboard
-import win32gui
 
 import Screen_Regions
 from ED_AP import *

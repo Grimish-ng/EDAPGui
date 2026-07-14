@@ -4,10 +4,12 @@ from ctypes.wintypes import PRECT
 from datetime import datetime
 from time import sleep
 
-import win32api
-import win32con
-import win32gui
-import win32ui
+import sys
+if sys.platform == "win32":
+    import win32api
+    import win32con
+    import win32gui
+    import win32ui
 from Screen_Regions import Quad, Point
 
 """
@@ -53,7 +55,7 @@ class Vector:
         _other = other.x + other.y + other.w + other.h
         return this != _other
 
-class Overlay:
+class _OverlayWin32:
        
     def __init__(self, parent_window, elite=0):
 
@@ -494,3 +496,19 @@ if __name__ == "__main__":
 
 
  
+
+class _OverlayNull:
+    """No-op overlay for platforms without the win32 layered-window backend.
+    Same public surface as the win32 overlay; all calls are ignored."""
+    def __init__(self, parent_window, elite=0):
+        pass
+    def __getattr__(self, name):
+        if name.startswith("overlay_"):
+            return lambda *a, **k: None
+        raise AttributeError(name)
+
+
+if sys.platform == "win32":
+    Overlay = _OverlayWin32
+else:
+    Overlay = _OverlayNull

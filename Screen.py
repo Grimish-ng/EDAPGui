@@ -3,9 +3,13 @@ import time
 import typing
 from copy import copy
 
+import sys
 import cv2
-import win32con
-import win32gui
+if sys.platform == "win32":
+    import win32con
+    import win32gui
+else:
+    import edap_linux
 import numpy as np
 from numpy import array
 import mss
@@ -36,6 +40,11 @@ def set_focus_elite_window():
     """ set focus to the ED window, if ED does not have focus then the keystrokes will go to the window
     that does have focus. """
     ed_title = "Elite - Dangerous (CLIENT)"
+
+    if sys.platform != "win32":
+        if not edap_linux.foreground_is_elite():
+            edap_linux.activate_elite_window()
+        return
 
     # TODO - determine if GetWindowText is faster than FindWindow if ED is in foreground
     if win32gui.GetWindowText(win32gui.GetForegroundWindow()) == ed_title:
@@ -196,6 +205,8 @@ class Screen:
         """ Gets the ED window rectangle.
         Returns (left, top, right, bottom) or None.
         """
+        if sys.platform != "win32":
+            return edap_linux.find_elite_window_rect()
         hwnd = win32gui.FindWindow(None, elite_dangerous_window)
         if hwnd:
             rect = win32gui.GetWindowRect(hwnd)
@@ -207,6 +218,8 @@ class Screen:
     def elite_window_exists() -> bool:
         """ Does the ED Client Window exist (i.e. is ED running)
         """
+        if sys.platform != "win32":
+            return edap_linux.elite_window_exists()
         hwnd = win32gui.FindWindow(None, elite_dangerous_window)
         if hwnd:
             return True

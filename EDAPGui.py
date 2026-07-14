@@ -11,7 +11,11 @@
 import subprocess
 from typing import TypedDict
 
-import keyboard
+import sys as _sys
+if _sys.platform == "win32":
+    import keyboard
+else:
+    import edap_linux as keyboard  # keyboard-compatible add_hotkey/remove_all_hotkeys (pynput)
 import webbrowser
 # import requests
 
@@ -22,7 +26,8 @@ from tkinter import filedialog as fd
 # from tkinter import messagebox
 from tkinter import ttk
 import sv_ttk
-import pywinstyles
+if _sys.platform == "win32":
+    import pywinstyles
 import sys  # Do not delete - prevents a 'super' error from tktoolip.
 from tktooltip import ToolTip  # In requirements.txt as 'tkinter-tooltip'.
 
@@ -1331,6 +1336,8 @@ class APGui:
 
 
 def apply_theme_to_titlebar(root):
+    if sys.platform != "win32":
+        return
     version = sys.getwindowsversion()
 
     if version.major == 10 and version.build >= 22000:

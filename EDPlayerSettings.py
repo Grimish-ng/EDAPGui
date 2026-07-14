@@ -73,7 +73,12 @@ class EDPlayerSettings:
         This routine will grab the *.misc file which is the latest modified
         :return:
         """
-        path_bindings = environ['LOCALAPPDATA'] + "\\Frontier Developments\\Elite Dangerous\\Options\\Player"
+        import sys
+        if sys.platform != "win32":
+            import edap_linux
+            path_bindings = edap_linux.player_options_dir()
+        else:
+            path_bindings = environ['LOCALAPPDATA'] + "\\Frontier Developments\\Elite Dangerous\\Options\\Player"
         try:
             list_of_bindings = [join(path_bindings, f) for f in listdir(path_bindings) if
                                 isfile(join(path_bindings, f)) and f.endswith('.misc')]

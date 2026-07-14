@@ -316,6 +316,8 @@ class _Hotkeys:
 
     @classmethod
     def _to_pynput(cls, combo: str) -> str:
+        if combo == ' ' or combo.strip().lower() == 'space':
+            return '<space>'
         parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
         out = []
         for p in parts:

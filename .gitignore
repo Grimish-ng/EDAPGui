@@ -24,3 +24,8 @@ configs/ship_configs.json
 test/match/
 debug-output/
 runs/
+autopilot *.log
+__pycache__/
+*.pyc
+.venv/
+.paddlex/

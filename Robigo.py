@@ -4,8 +4,6 @@ import time
 
 
 '''
-import keyboard
-
 import Screen_Regions
 from ED_AP import *
 from EDJournal import *

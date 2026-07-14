@@ -1,7 +1,4 @@
 from time import sleep
-
-import keyboard
-
 from EDJournal import *
 from EDKeys import *
 from EDlogger import logger

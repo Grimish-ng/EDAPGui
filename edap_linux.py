@@ -294,59 +294,192 @@ def foreground_is_elite() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Global hotkey shim: keyboard-lib-compatible surface backed by pynput
+# Global hotkeys via evdev
+#
+# pynput's Linux backend snoops keys through XRecord inside Xwayland, so on
+# a Wayland desktop it only sees keystrokes that happen to be routed to X
+# clients — hotkeys silently miss whenever focus is elsewhere. Reading
+# /dev/input/event* directly is compositor-independent: works on Wayland,
+# X11, and inside gamescope, regardless of window focus.
+#
+# Requires membership in the 'input' group (already required for uinput
+# injection). EDAP's own virtual keyboard is excluded so injected keys can
+# never trigger our own hotkeys.
+#
+# API surface is keyboard-lib compatible: add_hotkey(combo, cb, args=()),
+# remove_all_hotkeys(). Combos use keyboard-lib syntax: 'home', 'pgup',
+# 'ctrl+shift+x', ' ' (space).
 # ---------------------------------------------------------------------------
 
-class _Hotkeys:
-    """Drop-in for the subset of the `keyboard` module EDAPGui uses:
-       add_hotkey(combo, fn, args=()) / remove_all_hotkeys().
-       Combo strings use keyboard-lib syntax ('end', 'home', 'pgup',
-       'ctrl+shift+x'); converted to pynput ('<end>', '<ctrl>+<shift>+x')."""
+class _EvdevHotkeys:
+    _OWN_DEVICE = "edap-virtual-kbd"
+    _RESCAN_S = 3.0
 
-    _NAME_MAP = {
-        "pgup": "page_up", "pageup": "page_up", "page up": "page_up",
-        "pgdn": "page_down", "pagedown": "page_down", "page down": "page_down",
-        "ins": "insert", "del": "delete", "esc": "esc",
-        "return": "enter", "windows": "cmd", "win": "cmd",
+    # combo token -> acceptable keycode names (modifiers accept either side)
+    _MODS = {
+        "ctrl":  ("KEY_LEFTCTRL", "KEY_RIGHTCTRL"),
+        "control": ("KEY_LEFTCTRL", "KEY_RIGHTCTRL"),
+        "shift": ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"),
+        "alt":   ("KEY_LEFTALT", "KEY_RIGHTALT"),
+        "win":   ("KEY_LEFTMETA", "KEY_RIGHTMETA"),
+        "windows": ("KEY_LEFTMETA", "KEY_RIGHTMETA"),
+        "cmd":   ("KEY_LEFTMETA", "KEY_RIGHTMETA"),
+        "super": ("KEY_LEFTMETA", "KEY_RIGHTMETA"),
+    }
+    _NAMES = {
+        " ": "KEY_SPACE", "space": "KEY_SPACE",
+        "pgup": "KEY_PAGEUP", "pageup": "KEY_PAGEUP", "page up": "KEY_PAGEUP",
+        "pgdn": "KEY_PAGEDOWN", "pagedown": "KEY_PAGEDOWN", "page down": "KEY_PAGEDOWN",
+        "ins": "KEY_INSERT", "insert": "KEY_INSERT",
+        "del": "KEY_DELETE", "delete": "KEY_DELETE",
+        "esc": "KEY_ESC", "escape": "KEY_ESC",
+        "return": "KEY_ENTER", "enter": "KEY_ENTER",
+        "up": "KEY_UP", "down": "KEY_DOWN", "left": "KEY_LEFT", "right": "KEY_RIGHT",
+        "home": "KEY_HOME", "end": "KEY_END", "tab": "KEY_TAB",
+        "backspace": "KEY_BACKSPACE",
     }
 
     def __init__(self):
-        self._listener = None
-        self._map = {}
+        import threading
+        self._lock = threading.Lock()
+        self._hotkeys = []          # list of (mod_groups, keycode, callback)
+        self._down = set()          # currently held keycodes, all devices
+        self._thread = None
+        self._stop = threading.Event()
+
+    # -- combo parsing -------------------------------------------------------
 
     @classmethod
-    def _to_pynput(cls, combo: str) -> str:
-        if combo == ' ' or combo.strip().lower() == 'space':
-            return '<space>'
-        parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
-        out = []
-        for p in parts:
-            p = cls._NAME_MAP.get(p, p)
-            out.append(p if len(p) == 1 else f"<{p}>")
-        return "+".join(out)
+    def _resolve_key(cls, token: str) -> int:
+        from evdev import ecodes
+        t = token.strip().lower()
+        name = cls._NAMES.get(t)
+        if name is None:
+            cand = f"KEY_{t.upper()}"
+            if cand in ecodes.ecodes:
+                name = cand
+        if name is None:
+            raise ValueError(f"Unknown hotkey token: {token!r}")
+        return ecodes.ecodes[name]
+
+    @classmethod
+    def _parse(cls, combo: str):
+        """'ctrl+shift+x' -> ([(LCTRL,RCTRL),(LSHIFT,RSHIFT)], KEY_X).
+        A lone ' ' means space (split('+') would destroy it)."""
+        from evdev import ecodes
+        if combo.strip() == "" and " " in combo:
+            return [], ecodes.ecodes["KEY_SPACE"]
+        parts = [p for p in combo.split("+") if p.strip()]
+        if not parts:
+            raise ValueError(f"Empty hotkey combo: {combo!r}")
+        mods = []
+        for p in parts[:-1]:
+            names = cls._MODS.get(p.strip().lower())
+            if names is None:
+                raise ValueError(f"Unknown modifier: {p!r}")
+            mods.append(tuple(ecodes.ecodes[n] for n in names))
+        return mods, cls._resolve_key(parts[-1])
+
+    # -- public API (keyboard-lib compatible) --------------------------------
 
     def add_hotkey(self, combo, callback, args=()):
-        key = self._to_pynput(combo)
-        self._map[key] = (lambda cb=callback, a=tuple(args): cb(*a))
-        self._restart()
+        mods, key = self._parse(combo)
+        a = tuple(args)
+        with self._lock:
+            self._hotkeys.append((mods, key, (lambda cb=callback, aa=a: cb(*aa))))
+        self._ensure_thread()
 
     def remove_all_hotkeys(self):
-        self._map.clear()
-        self._restart()
+        with self._lock:
+            self._hotkeys.clear()
 
-    def _restart(self):
-        if self._listener is not None:
-            self._listener.stop()
-            self._listener = None
-        if not self._map:
+    # -- event handling (separated for testability) --------------------------
+
+    def _handle_key(self, code: int, value: int):
+        from EDlogger import logger
+        if value == 0:
+            self._down.discard(code)
             return
-        from pynput import keyboard as pk
-        self._listener = pk.GlobalHotKeys(dict(self._map))
-        self._listener.daemon = True
-        self._listener.start()
+        if value != 1:              # 2 = autorepeat; fire on initial press only
+            return
+        self._down.add(code)
+        with self._lock:
+            hks = list(self._hotkeys)
+        for mods, key, cb in hks:
+            if code != key:
+                continue
+            if all(any(m in self._down for m in group) for group in mods):
+                try:
+                    cb()
+                except Exception as ex:
+                    logger.error(f"hotkey callback failed: {ex}")
+
+    # -- device management ----------------------------------------------------
+
+    @classmethod
+    def _is_keyboard(cls, dev) -> bool:
+        from evdev import ecodes
+        if dev.name == cls._OWN_DEVICE:
+            return False
+        keys = dev.capabilities().get(ecodes.EV_KEY)
+        # heuristic: a real keyboard exposes the main letter block
+        return bool(keys) and ecodes.KEY_A in keys and ecodes.KEY_Z in keys
+
+    def _scan(self, sel, registered):
+        import evdev
+        for path in evdev.list_devices():
+            if path in registered:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+                if self._is_keyboard(dev):
+                    sel.register(dev, 1)
+                    registered[path] = dev
+                else:
+                    dev.close()
+            except (OSError, PermissionError):
+                continue
+
+    def _loop(self):
+        import selectors
+        import time as _time
+        from evdev import ecodes
+        from EDlogger import logger
+        sel = selectors.DefaultSelector()
+        registered = {}
+        self._scan(sel, registered)
+        if not registered:
+            logger.warning("evdev hotkeys: no keyboard devices readable — "
+                           "check 'input' group membership.")
+        last_scan = _time.monotonic()
+        while not self._stop.is_set():
+            for skey, _ in sel.select(timeout=1.0):
+                dev = skey.fileobj
+                try:
+                    for ev in dev.read():
+                        if ev.type == ecodes.EV_KEY:
+                            self._handle_key(ev.code, ev.value)
+                except OSError:            # device unplugged
+                    sel.unregister(dev)
+                    registered.pop(dev.path, None)
+                    try:
+                        dev.close()
+                    except OSError:
+                        pass
+            if _time.monotonic() - last_scan > self._RESCAN_S:
+                self._scan(sel, registered)
+                last_scan = _time.monotonic()
+
+    def _ensure_thread(self):
+        import threading
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop,
+                                            name="evdev-hotkeys", daemon=True)
+            self._thread.start()
 
 
-hotkeys = _Hotkeys()
+hotkeys = _EvdevHotkeys()
 add_hotkey = hotkeys.add_hotkey
 remove_all_hotkeys = hotkeys.remove_all_hotkeys
 

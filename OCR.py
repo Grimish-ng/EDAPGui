@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import queue
 import threading
 import time
 import cv2
@@ -31,24 +32,14 @@ class OCR:
         """
         self.ap = ed_ap
         self.screen = screen
-        # PaddleOCR's predictor is NOT thread-safe: concurrent predict() calls
-        # from the AP thread and the supercruise monitor thread corrupt the
-        # C++ inference session (the 'std::exception' / 'Unknown exception'
-        # failures the reinit path exists to paper over). Serialize all access.
-        # RLock: the failure handler reinitializes while the lock is held.
-        self._ocr_lock = threading.RLock()
-        if self.ap.config['OCRMobile']:
-            self.paddleocr = PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="en_PP-OCRv5_mobile_rec")  # text detection + text recognition
-        else:
-            self.paddleocr = PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False)  # text detection + text recognition
+        self._ocr_lock = threading.RLock()  # legacy; queue handoff serializes
+        self._ocr_queue = queue.Queue()
+        ready = {'event': threading.Event()}
+        threading.Thread(target=self._worker_main, args=(ready,),
+                         name="ocr-worker", daemon=True).start()
+        ready['event'].wait()
+        if 'error' in ready:
+            raise ready['error']
 
         # Class for text similarity metrics
         self.jarowinkler = JaroWinkler()
@@ -56,29 +47,68 @@ class OCR:
         self.normalized_levenshtein = NormalizedLevenshtein()
 
     def _reinit_paddleocr(self):
-        """ Reinitialize PaddleOCR after a failure. PaddleOCR's C++ layer can throw
-        an 'Unknown exception' which corrupts internal state. If the same instance is
-        reused, the next call will cause a hard process crash with no Python traceback.
-        Creating a fresh instance prevents this. """
+        """ Reinitialize PaddleOCR after a failure. Executed on the OCR
+        worker thread (paddle state must live and die on one thread). """
         try:
-          with self._ocr_lock:
-            logger.warning("Reinitializing PaddleOCR after failure.")
-            if self.ap.config['OCRMobile']:
-                self.paddleocr = PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    text_detection_model_name="PP-OCRv5_mobile_det",
-                    text_recognition_model_name="en_PP-OCRv5_mobile_rec")  # text detection + text recognition
-            else:
-                self.paddleocr = PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False)  # text detection + text recognition
-
-
+            self._submit('reinit')
         except Exception as e:
             logger.error(f"Failed to reinitialize PaddleOCR: {e}")
+    # -- OCR worker thread ----------------------------------------------------
+    # Paddle predictors have thread affinity (oneDNN state binds to the
+    # creating thread). All construction, prediction, and reinitialization
+    # happens on this one thread; other threads submit jobs via the queue.
+
+    def _construct_paddleocr(self):
+        if self.ap.config['OCRMobile']:
+            return PaddleOCR(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="en_PP-OCRv5_mobile_rec")
+        return PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False)
+
+    def _worker_main(self, ready):
+        try:
+            self.paddleocr = self._construct_paddleocr()
+            ready['ok'] = True
+        except Exception as ex:
+            ready['error'] = ex
+        finally:
+            ready['event'].set()
+        if 'error' in ready:
+            return
+        while True:
+            job = self._ocr_queue.get()
+            kind, payload, done = job
+            try:
+                if kind == 'predict':
+                    done['result'] = self.paddleocr.predict(payload)
+                elif kind == 'reinit':
+                    logger.warning("Reinitializing PaddleOCR after failure.")
+                    self.paddleocr = self._construct_paddleocr()
+                    done['result'] = None
+            except Exception as ex:
+                done['error'] = ex
+            finally:
+                done['event'].set()
+
+    def _submit(self, kind, payload=None, timeout=60.0):
+        done = {'event': threading.Event()}
+        self._ocr_queue.put((kind, payload, done))
+        if not done['event'].wait(timeout):
+            raise TimeoutError(f"OCR worker did not answer a '{kind}' job "
+                               f"within {timeout}s")
+        if 'error' in done:
+            raise done['error']
+        return done.get('result')
+
+    def _predict(self, image):
+        return self._submit('predict', image)
+
 
     def _dump_failed_image(self, name, image):
         """Save the offending image for post-mortem. Ensures the output dir
@@ -152,8 +182,7 @@ class OCR:
             # Remove Alpha channel if it exists
             image2 = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
             t0 = time.perf_counter()
-            with self._ocr_lock:
-                ocr_data = self.paddleocr.predict(image2)
+            ocr_data = self._predict(image2)
             logger.debug(f"ocr predict [{name}] {(time.perf_counter() - t0) * 1000.0:.0f}ms img={image2.shape}")
 
             if ocr_data is None:
@@ -212,8 +241,7 @@ class OCR:
                 return None
 
             t0 = time.perf_counter()
-            with self._ocr_lock:
-                ocr_data = self.paddleocr.predict(image2)
+            ocr_data = self._predict(image2)
             logger.debug(f"ocr predict [{name}] {(time.perf_counter() - t0) * 1000.0:.0f}ms img={image2.shape}")
 
             if ocr_data is None:

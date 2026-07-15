@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os
+import threading
 import time
 import cv2
 import numpy as np
@@ -29,6 +31,12 @@ class OCR:
         """
         self.ap = ed_ap
         self.screen = screen
+        # PaddleOCR's predictor is NOT thread-safe: concurrent predict() calls
+        # from the AP thread and the supercruise monitor thread corrupt the
+        # C++ inference session (the 'std::exception' / 'Unknown exception'
+        # failures the reinit path exists to paper over). Serialize all access.
+        # RLock: the failure handler reinitializes while the lock is held.
+        self._ocr_lock = threading.RLock()
         if self.ap.config['OCRMobile']:
             self.paddleocr = PaddleOCR(
                 use_doc_orientation_classify=False,
@@ -53,6 +61,7 @@ class OCR:
         reused, the next call will cause a hard process crash with no Python traceback.
         Creating a fresh instance prevents this. """
         try:
+          with self._ocr_lock:
             logger.warning("Reinitializing PaddleOCR after failure.")
             if self.ap.config['OCRMobile']:
                 self.paddleocr = PaddleOCR(
@@ -67,8 +76,30 @@ class OCR:
                     use_doc_unwarping=False,
                     use_textline_orientation=False)  # text detection + text recognition
 
+
         except Exception as e:
             logger.error(f"Failed to reinitialize PaddleOCR: {e}")
+
+    def _dump_failed_image(self, name, image):
+        """Save the offending image for post-mortem. Ensures the output dir
+        exists and an image extension is present (imwrite dispatches on it)."""
+        try:
+            os.makedirs("./ocr_output", exist_ok=True)
+            fname = name if os.path.splitext(name)[1] else f"{name}.png"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            cv2.imwrite(f"./ocr_output/{stamp}-{fname}", image)
+            logger.error("Image stored to ocr_output folder.")
+        except Exception as ex:
+            logger.error(f"Could not save OCR failure image: {ex}")
+
+    @staticmethod
+    def _text_likely(image_bgr) -> bool:
+        """Cheap pre-OCR gate: HUD text is bright-on-dark. If the region has
+        almost no bright pixels there is nothing to read — skip the (CPU-
+        expensive) paddle predict. Threshold is conservative so real text,
+        even dim/anti-aliased, always passes."""
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        return int(cv2.countNonZero(cv2.compare(gray, 140, cv2.CMP_GT))) > 40
 
     def string_similarity(self, s1: str, s2: str) -> float:
         """ Performs a string similarity check and returns the result.
@@ -120,7 +151,10 @@ class OCR:
         try:
             # Remove Alpha channel if it exists
             image2 = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-            ocr_data = self.paddleocr.predict(image2)
+            t0 = time.perf_counter()
+            with self._ocr_lock:
+                ocr_data = self.paddleocr.predict(image2)
+            logger.debug(f"ocr predict [{name}] {(time.perf_counter() - t0) * 1000.0:.0f}ms img={image2.shape}")
 
             if ocr_data is None:
                 return None, None
@@ -147,8 +181,7 @@ class OCR:
             logger.error(f"OCR failed: {e}")
             # Reinit to avoid hard crash on next call due to corrupted C++ state
             self._reinit_paddleocr()
-            logger.error(f"Image stored to ocr_output folder.")
-            cv2.imwrite(f"./ocr_output/{name}", image)
+            self._dump_failed_image(name, image)
             return None, None
 
     def image_simple_ocr(self, image, name='') -> list[str] | None:
@@ -171,10 +204,17 @@ class OCR:
         try:
             # Remove Alpha channel if it exists
             image2 = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-            ocr_data = self.paddleocr.predict(image2)
 
-            # elapsed_time = time.time() - start_time
-            # print(f"OCR took {elapsed_time} secs")
+            # Nothing bright enough to be HUD text -> skip the expensive predict.
+            # Matters most for the supercruise disengage poll loop, which calls
+            # this continuously while the region is usually empty.
+            if not self._text_likely(image2):
+                return None
+
+            t0 = time.perf_counter()
+            with self._ocr_lock:
+                ocr_data = self.paddleocr.predict(image2)
+            logger.debug(f"ocr predict [{name}] {(time.perf_counter() - t0) * 1000.0:.0f}ms img={image2.shape}")
 
             if ocr_data is None:
                 return None
@@ -203,8 +243,7 @@ class OCR:
             logger.error(f"OCR failed: {e}")
             # Reinit to avoid hard crash on next call due to corrupted C++ state
             self._reinit_paddleocr()
-            logger.error(f"Image stored to ocr_output folder.")
-            cv2.imwrite(f"./ocr_output/{name}", image)
+            self._dump_failed_image(name, image)
             return None
 
     def get_highlighted_item_data(self, image, item: Quad, name=''):

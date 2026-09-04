@@ -1,0 +1,10 @@
+{
+  "name": "EDAP Autopilot",
+  "author": "grimish",
+  "flags": [],
+  "publish": {
+    "tags": ["elite-dangerous", "autopilot"],
+    "description": "Control the EDAP Elite Dangerous autopilot daemon (FSD route assist, supercruise assist, waypoints) from the Quick Access Menu.",
+    "image": ""
+  }
+}

@@ -29,3 +29,5 @@ __pycache__/
 *.pyc
 .venv/
 .paddlex/
+decky-edap/node_modules/
+decky-edap/dist/

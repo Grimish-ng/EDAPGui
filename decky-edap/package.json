@@ -1,0 +1,21 @@
+{
+  "name": "decky-edap",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Decky Loader frontend for the EDAP autopilot daemon",
+  "scripts": {
+    "build": "shx rm -rf dist && rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "devDependencies": {
+    "@decky/api": "^1.1.2",
+    "@decky/rollup": "^1.0.1",
+    "@decky/ui": "^4.7.2",
+    "@types/react": "^19.2.17",
+    "react-icons": "^5.7.0",
+    "rollup": "^4.22.4",
+    "shx": "^0.3.4",
+    "typescript": "^5.5.0"
+  },
+  "pnpm": {}
+}

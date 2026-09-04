@@ -1,0 +1,22 @@
+[Unit]
+Description=EDAP headless autopilot engine for Elite Dangerous
+Documentation=http://vs-dupe.lan:3000/grimish/EDAPGui-linux
+# needs the session's Xwayland/X server for capture + window ops
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/EDAPGui
+ExecStart=%h/src/EDAPGui/.venv/bin/python %h/src/EDAPGui/edap_daemon.py
+# DISPLAY of the session ED runs in; override per-session via drop-in:
+#   /etc/systemd/system/... is for system units — this is a USER unit, so:
+#   ~/.config/systemd/user/edap-daemon.service.d/override.conf
+#   [Service]
+#   Environment=DISPLAY=:1
+Environment=DISPLAY=:0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

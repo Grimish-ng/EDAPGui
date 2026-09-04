@@ -10,6 +10,7 @@ if sys.platform == "win32":
     import win32gui
 else:
     import edap_linux
+    import edap_capture
 import numpy as np
 from numpy import array
 import mss
@@ -278,11 +279,14 @@ class Screen:
             # Rootless Xwayland (Plasma Wayland) has no grabbable root window,
             # so mss/XGetImage cannot be used. Grab the ED window's composited
             # backing pixmap via XComposite instead. Also correct on plain X11.
+            # Pluggable backend: XComposite (KWin/Plasma) or PipeWire
+            # (gamescope, whose own compositing leaves the X backing pixmap
+            # unpainted). Selected on first use; EDAP_CAPTURE forces one.
             try:
-                image = edap_linux.grab_region(monitor["left"], monitor["top"],
-                                               monitor["width"], monitor["height"])
+                image = edap_capture.grab_region(monitor["left"], monitor["top"],
+                                                 monitor["width"], monitor["height"])
             except Exception as e:
-                self._warn_capture_failure(f"XComposite grab failed: {type(e).__name__}: {e}")
+                self._warn_capture_failure(f"capture failed: {type(e).__name__}: {e}")
                 return None
         else:
             try:

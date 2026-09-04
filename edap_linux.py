@@ -152,9 +152,26 @@ def get_path(folderid, user_handle=UserHandle.current) -> str:
 # X11 window utilities (python-xlib)
 # ---------------------------------------------------------------------------
 
-def _display():
+_display_name = None   # display that was last seen holding the ED window
+
+
+def _candidate_displays():
+    """$DISPLAY first, then every X socket on the machine."""
+    import glob
+    names = []
+    env = os.environ.get("DISPLAY")
+    if env:
+        names.append(env)
+    for p in sorted(glob.glob("/tmp/.X11-unix/X*")):
+        n = ":" + p.rsplit("X", 1)[1]
+        if n not in names:
+            names.append(n)
+    return names
+
+
+def _display(name=None):
     from Xlib import display  # lazy: only needed at runtime on X11
-    return display.Display()
+    return display.Display(name or _display_name)
 
 
 def _iter_client_windows(d):
@@ -194,18 +211,43 @@ def _walk_windows(w):
         return
 
 
-def _find_elite_window():
-    d = _display()
+def _search_display(d):
     # Preferred: EWMH client list (real X window managers)
     for win in _iter_client_windows(d):
         if _window_title(d, win) == ELITE_WINDOW_TITLE:
-            return d, win
-    # Fallback: full tree walk. Required on KWin/Plasma Wayland, where the
-    # rootless Xwayland root does not carry a usable _NET_CLIENT_LIST.
+            return win
+    # Fallback: full tree walk. Required on KWin Wayland and gamescope,
+    # whose Xwayland roots lack a usable _NET_CLIENT_LIST.
     for win in _walk_windows(d.screen().root):
         if _window_title(d, win) == ELITE_WINDOW_TITLE:
+            return win
+    return None
+
+
+def _find_elite_window():
+    """Search the cached display, then every display on the machine.
+    On a hit, cache and export DISPLAY so capture/injection/automation
+    downstream bind to the same X server the game is on."""
+    global _display_name
+    order = []
+    if _display_name:
+        order.append(_display_name)
+    order += [n for n in _candidate_displays() if n not in order]
+    for name in order:
+        try:
+            d = _display(name)
+        except Exception:
+            continue
+        try:
+            win = _search_display(d)
+        except Exception:
+            win = None
+        if win is not None:
+            if _display_name != name:
+                _display_name = name
+                os.environ["DISPLAY"] = name
             return d, win
-    d.close()
+        d.close()
     return None, None
 
 
